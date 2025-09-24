@@ -1,0 +1,1615 @@
+---
+title: "T2D_meta_analysis"
+output: html_document
+date: "2025-09-24"
+---
+Load requirements
+```{r message=FALSE}
+
+
+# Check and install other packages if needed
+
+library(cluster) 
+library(limma) 
+library(ggraph)
+library(DESeq2)
+library(variancePartition)
+library(clusterProfiler)
+library(RColorBrewer)
+library(tidyverse)
+library(factoextra)
+library(stats) 
+library(gplots)
+library(fitdistrplus)
+library(variancePartition)
+library(Biobase)
+library(edgeR)
+library(BiocParallel)
+library(metaRNASeq)
+library(WGCNA)
+library(ExperimentHub)
+library(GSEABase)
+library(msigdb)
+library(msigdbr)
+library(Hmisc)
+library(GGally)
+library(immunedeconv)
+library(ggrepel)
+library(ComplexHeatmap)
+library(circlize)
+library(broom)
+library(lme4)
+library(lmerTest)
+
+```
+
+# Define analysis functions
+```{r}
+combine_tibbles_with_names <- function(df_names, ...) {
+  # Capture all input data frames and their names
+  df_list <- list(...)
+  # df_names <- as.character(substitute(list(...)))[-1]
+  
+  
+  
+  # Check if any inputs were provided
+  if (length(df_list) == 0) {
+    stop("No data frames provided")
+  }
+  
+  # Add source_name column to each data frame and combine
+  map2_dfr(df_list, df_names, ~ {
+    .x %>% rownames_to_column("GeneID") %>% 
+      mutate(cohort = .y)
+  })
+}
+
+get_vst_data <- function(counts, meta, des, main_contrast="condition_T2D_vs_Health") {
+  # Create DESeq dataset
+  dds <- DESeqDataSetFromMatrix(counts %>% 
+                                  dplyr::select(GeneID, any_of(meta$sample)) %>% 
+                                  column_to_rownames('GeneID') %>% 
+                                  as.matrix(), 
+                                meta, design = des)
+  
+  # Run DESeq
+  dds <- DESeq(dds)
+
+  # Print summary for every contrast
+  for (contrast in resultsNames(dds)) {
+    if (contrast != "Intercept") {
+      cat("Summary for contrast:", contrast, "\n")
+      print(summary(results(dds, name = contrast)))
+      cat("\n")
+    }
+  }
+  
+  # Perform variance stabilizing transformation
+  vsd <- varianceStabilizingTransformation(dds)
+
+  return(vsd)
+}
+
+combine_tsv_files <- function(folder_path) {
+  # Get list of TSV files in the folder
+  file_list <- list.files(path = folder_path, pattern = "\\.featureCounts$", full.names = TRUE)
+  
+  # Check if there are any files
+  if (length(file_list) == 0) {
+    stop("No files found in the specified folder")
+  }
+  
+  renamer_fun <- function(string)
+  {
+  string %>% str_split_i("/", 4) %>% str_split_i("_", 1) %>% 
+    str_replace("Drib", "T2D000") %>% str_replace("Oneg", "K000")
+  }
+  
+  
+  combine_df <- function(df1, df2)
+  {
+  df1 %>% 
+    dplyr::select(Geneid, contains("bam")) %>% 
+    inner_join(df2 %>% 
+                 dplyr::select(Geneid, contains("bam")),
+               by = "Geneid")
+  }
+
+  
+  # Read all files into a list of data frames
+  
+  
+  df_list <- map(file_list, read_tsv, comment = "#", show_col_types = FALSE)
+  
+  purrr::reduce(df_list, combine_df) %>% rename_with(~ renamer_fun(.x), ends_with("bam"))
+}
+
+infer_sex <- function(counts, meta)
+{
+  sex_table <- counts %>% 
+  filter(GeneID == 8284 | GeneID == 7503) %>% 
+  pivot_longer(cols = starts_with("GSM")) %>% 
+  pivot_wider(names_from = GeneID, values_from = value) %>% 
+  transmute(name, sex = ifelse(`7503` > `8284`, 'female', 'male'))
+
+  meta %>% 
+  left_join(sex_table, by=c('sample' = 'name')) %>% 
+  drop_na()
+
+}
+
+
+find_outliers <- function(input_data, 
+                         CCC_min = 0.8, 
+                         SC_max = 0.25, 
+                         robpca_prob = 0.975, 
+                         PcaGrid_prob = 0.975,
+                         concordance_measure = 3) 
+  {
+  
+  # Load required libraries
+  if (!require(factoextra, quietly = TRUE)) {
+    stop("Package 'factoextra' is required but not installed")
+  }
+  if (!require(cluster, quietly = TRUE)) {
+    stop("Package 'cluster' is required but not installed")
+  }
+  if (!require(rospca, quietly = TRUE)) {
+    stop("Package 'rospca' is required but not installed")
+  }
+  if (!require(rrcov, quietly = TRUE)) {
+    stop("Package 'rrcov' is required but not installed")
+  }
+  
+  # Transpose data for analysis (samples as rows)
+  input_data_t <- t(input_data)
+  
+  # Initialize outlier lists
+  hcOutliers <- c()
+  rosOutliers <- c()
+  pcOutliers <- c()
+  ccc_passed <- FALSE
+  ccc_value <- 0
+  
+  cat("Starting outlier detection analysis...\n")
+  
+  # 1. Hierarchical Clustering Analysis with Silhouette
+  tryCatch({
+    cat("Performing hierarchical clustering analysis...\n")
+    
+    # Set maximum number of clusters
+    MaxPosNumClusters <- min(c(20, (dim(input_data)[2] - 1)))
+    
+    if (MaxPosNumClusters >= 2) {
+      # First attempt with gap statistic
+      hc.res_a <- eclust(input_data_t, FUNcluster = "hclust", k = NULL, 
+                         k.max = MaxPosNumClusters, stand = FALSE, graph = FALSE, 
+                         hc_metric = "euclidean", hc_method = "ward.D2", 
+                         nboot = 50, seed = 78)
+      
+      nbclust_GapStat <- hc.res_a$nbclust
+      
+      # If gap statistic fails or suggests only 1 cluster, use silhouette method
+      if (nbclust_GapStat <= 1) {
+        cat("Using silhouette method for cluster number estimation...\n")
+        numClust_i <- 1:MaxPosNumClusters
+        numClust_AvgSC <- rep(-1, MaxPosNumClusters)  # Initialize with -1
+        numClust_df <- data.frame(numClust_i, numClust_AvgSC) 
+        
+        for (i in 2:MaxPosNumClusters) {
+          tryCatch({
+            temp_hc <- eclust(input_data_t, FUNcluster = "hclust", k = i, 
+                              stand = FALSE, graph = FALSE, 
+                              hc_metric = "euclidean", hc_method = "ward.D2", 
+                              nboot = 50, seed = 78)
+            numClust_df[i, 2] <- temp_hc$silinfo$avg.width
+          }, error = function(e) {
+            # If this k fails, keep the default -1 value
+          })
+        }
+        
+        # Remove rows with failed calculations and find optimal k
+        valid_rows <- numClust_df$numClust_AvgSC > -1
+        if (sum(valid_rows) > 0) {
+          numClust_df_valid <- numClust_df[valid_rows, ]
+          if (nrow(numClust_df_valid) > 0) {
+            numClust_df_ranked <- numClust_df_valid[order(-numClust_df_valid$numClust_AvgSC), ]
+            optimal_k <- numClust_df_ranked[1, 1]
+            
+            hc.res_a <- eclust(input_data_t, FUNcluster = "hclust", k = optimal_k, 
+                               stand = FALSE, graph = FALSE, 
+                               hc_metric = "euclidean", hc_method = "ward.D2", 
+                               nboot = 50, seed = 78)
+          }
+        }
+      }
+      
+      # Calculate CCC (Cophenetic Correlation Coefficient)
+      tryCatch({
+        dist_matrix <- dist(input_data_t)
+        cophenetic_dist <- cophenetic(hc.res_a$hclust)
+        ccc_value <- cor(dist_matrix, cophenetic_dist)
+        
+        cat("CCC value:", ccc_value, "\n")
+        
+        # Check if CCC passes threshold
+        if (ccc_value >= CCC_min) {
+          ccc_passed <- TRUE
+          
+          # Get silhouette information
+          if (!is.null(hc.res_a$silinfo) && !is.null(hc.res_a$silinfo$widths)) {
+            sil_a <- hc.res_a$silinfo$widths
+            if (is.matrix(sil_a) || is.data.frame(sil_a)) {
+              # Identify outliers based on SC
+              if (ncol(sil_a) >= 2) {
+                neg_sil_index_a <- which(sil_a[, 2] < SC_max)  # Second column should be silhouette width
+                if (length(neg_sil_index_a) > 0) {
+                  hcOutliers <- rownames(sil_a)[neg_sil_index_a]
+                  cat("HCA outliers identified:", length(hcOutliers), "\n")
+                }
+              }
+            }
+          }
+        } else {
+          cat("CCC below threshold, HCA results not used for consensus\n")
+        }
+      }, error = function(e) {
+        warning("Error calculating CCC: ", e$message)
+      })
+    }
+  }, error = function(e) {
+    warning("Error in hierarchical clustering analysis: ", e$message)
+  })
+  
+  # 2. Robust PCA (robpca)
+  tryCatch({
+    cat("Performing robpca analysis...\n")
+    resR0 <- robpca(input_data_t, k = 0, crit.pca.distances = robpca_prob, 
+                    ndir = 2000, skew = FALSE)  # Reduced ndir for faster computation
+    
+    resR0_flag <- as.data.frame(resR0$flag.all)
+    resR0_flag$sample <- row.names(resR0_flag)
+    colnames(resR0_flag) <- c('regular', 'sample')
+    resR0_flag$regular <- as.numeric(resR0_flag$regular)
+    
+    rosOutliers <- resR0_flag[resR0_flag$regular == 0, ]$sample
+    cat("robpca outliers identified:", length(rosOutliers), "\n")
+  }, error = function(e) {
+    warning("Error in robpca analysis: ", e$message)
+  })
+  
+  # 3. Robust PCA (PcaGrid)
+  tryCatch({
+    cat("Performing PcaGrid analysis...\n")
+    pc <- PcaGrid(input_data_t, crit.pca.distances = PcaGrid_prob)
+    
+    pc_flag <- as.data.frame(pc$flag)
+    pc_flag$sample <- row.names(pc_flag)
+    colnames(pc_flag) <- c('regular', 'sample')
+    pc_flag$regular <- as.numeric(pc_flag$regular)
+    
+    pcOutliers <- pc_flag[pc_flag$regular == 0, ]$sample
+    cat("PcaGrid outliers identified:", length(pcOutliers), "\n")
+  }, error = function(e) {
+    warning("Error in PcaGrid analysis: ", e$message)
+  })
+  
+  # 4. Determine consensus outliers based on concordance measure
+  cat("Determining consensus outliers...\n")
+  
+  # Collect all available outlier lists
+  all_outliers <- list()
+  method_names <- c()
+  
+  if (ccc_passed && length(hcOutliers) > 0) {
+    all_outliers[[length(all_outliers) + 1]] <- hcOutliers
+    method_names[length(all_outliers)] <- "HCA"
+    cat("Including HCA results in consensus (CCC =", ccc_value, ")\n")
+  }
+  
+  if (length(rosOutliers) > 0) {
+    all_outliers[[length(all_outliers) + 1]] <- rosOutliers
+    method_names[length(all_outliers)] <- "robpca"
+    cat("Including robpca results in consensus\n")
+  }
+  
+  if (length(pcOutliers) > 0) {
+    all_outliers[[length(all_outliers) + 1]] <- pcOutliers
+    method_names[length(all_outliers)] <- "PcaGrid"
+    cat("Including PcaGrid results in consensus\n")
+  }
+  
+  cat("Number of methods with results:", length(all_outliers), "\n")
+  cat("Required concordance:", concordance_measure, "\n")
+  
+  # If we don't have enough methods, adjust concordance measure
+  if (length(all_outliers) == 0) {
+    cat("No outlier detection methods produced results\n")
+    return(character(0))
+  }
+  
+  if (length(all_outliers) < concordance_measure) {
+    old_concordance <- concordance_measure
+    concordance_measure <- max(1, length(all_outliers))  # At least 1 if there are methods
+    cat("Adjusted concordance measure from", old_concordance, "to", concordance_measure, "\n")
+  }
+  
+  # Find samples that appear in at least 'concordance_measure' methods
+  if (length(all_outliers) > 0) {
+    # Get all unique outlier samples
+    all_samples <- unique(unlist(all_outliers))
+    
+    if (length(all_samples) > 0) {
+      # Count how many methods each sample is identified as outlier
+      sample_counts <- sapply(all_samples, function(sample) {
+        sum(sapply(all_outliers, function(method_outliers) {
+          sample %in% method_outliers
+        }))
+      })
+      
+      # Show counts for debugging
+      cat("Sample outlier counts:\n")
+      for (i in seq_along(sample_counts)) {
+        cat("  ", names(sample_counts)[i], ":", sample_counts[i], "\n")
+      }
+      
+      # Return samples that meet concordance threshold
+      consensus_outliers <- names(sample_counts)[sample_counts >= concordance_measure]
+      cat("Consensus outliers (concordance >=", concordance_measure, "):", length(consensus_outliers), "\n")
+      
+      if (length(consensus_outliers) > 0) {
+        cat("Outlier samples:", paste(consensus_outliers, collapse = ", "), "\n")
+      }
+      
+      return(consensus_outliers)
+    }
+  }
+  
+  cat("No consensus outliers found\n")
+  return(character(0))
+}
+
+dream_analysis <- function(count_table, metadata, formula, main_contrast)
+{
+  param <- SnowParam(4, "SOCK", progressbar = TRUE)
+  
+  
+  countMatrix <- count_table %>% column_to_rownames("GeneID") %>% 
+                                  dplyr::select(any_of(metadata$sample))
+  
+  isexpr <- rowSums(cpm(countMatrix) > 0.1) >= 5
+
+  dge <- DGEList(countMatrix[isexpr, ])
+  dge <- calcNormFactors(dge)
+
+  L <- makeContrastsDream(formula, metadata,
+  contrasts = c(
+    Test1 = main_contrast
+    )
+  )
+  
+  vobjDream <- voomWithDreamWeights(dge, formula, metadata, BPPARAM = param)
+
+  fitmm <- dream(vobjDream, formula, metadata, L = L)
+  fitmm <- eBayes(fitmm)
+  
+  return(fitmm)
+}
+
+
+```
+# our data, GSE280402
+```{r}
+our_counts <- combine_tsv_files("Counts/Our_data/") %>% 
+  dplyr::rename(Symbol = Geneid)
+
+# harmonize gene labels
+annotation <- read_tsv("Human.GRCh38.p13.annot.tsv.gz") %>% 
+  transmute(GeneID, Symbol)
+
+our_counts <- our_counts %>% 
+  left_join(annotation, by = "Symbol") %>% 
+  drop_na()
+
+
+our_outliers <- find_outliers(our_counts %>%
+  dplyr::select(-Symbol) %>%
+  column_to_rownames("GeneID") %>%
+  filter_all(any_vars(. != 0)) %>% # filter all-zero rows
+  drop_na(), concordance_measure = 2)
+
+
+# meta
+our_meta <- read_table("Meta/coldata.tsv") %>% 
+  mutate(sex = ifelse(sex == 'м', "male", "female"),
+         heredity = ifelse(heredity == "да", 'yes', 'no'),
+         education = ifelse(education == 'ВО', "higher", "middle"),
+         BMI = BMI,
+         gluc_level = gluc_level,
+         cholesterol = cholesterol) %>% 
+  transmute(sample = Sample, sex, condition = ifelse(str_detect(group, 'T2D'),
+                                                                "T2D",
+                                                                "Health")) %>% 
+  filter(!sample %in% our_outliers) # remove outliers
+
+
+our_dream <- dream_analysis(our_counts, our_meta, ~ 0 + condition + sex, "conditionT2D - conditionHealth")
+
+
+our_dream_res <- topTable(our_dream, coef = "Test1", number = Inf) %>% 
+  as.data.frame()
+
+
+
+
+```
+# GSE154881
+```{r}
+GSE154881_counts <- read_delim("Counts/GSE154881_raw_counts_GRCh38.p13_NCBI.tsv.gz", delim = "\t")
+
+
+GSE154881_outliers <- find_outliers(GSE154881_counts %>%
+
+  column_to_rownames("GeneID") %>%
+  filter_all(any_vars(. != 0)) %>% # filter all-zero rows
+  drop_na(), concordance_measure = 2)
+
+GSE154881_meta <- read.csv("Meta/GSE154881_SraRunTable.csv") %>% 
+  filter(str_detect(disease_state, "Nephropathy", negate = T)) %>% 
+  transmute(sample = Sample.Name, age = AGE, condition = ifelse(str_detect(disease_state, 'Diabetes'),
+                                                                "T2D",
+                                                                "Health")) %>% 
+  # mutate(age_scaled = scale(age, center = TRUE, scale = TRUE))
+  mutate(age_cat = ifelse(age < 50, 'young', 'old')) %>% 
+  transmute(sample, age_cat, condition) %>% 
+  
+  filter(!sample %in% GSE154881_outliers) # remove outliers
+
+## Infer sex; 7503 - XIST - female marker; 8284 - KDM5D - male marker
+
+# infer sex
+GSE154881_meta <- infer_sex(GSE154881_counts, GSE154881_meta)
+
+GSE154881_dream <- dream_analysis(GSE154881_counts, GSE154881_meta, ~ 0 + condition + sex, "conditionT2D - conditionHealth")
+
+GSE154881_dream_res <- topTable(GSE154881_dream, coef = "Test1", number = Inf) %>% 
+  as.data.frame()
+
+```
+# GSE153315
+```{r}
+GSE153315_counts <- read_delim("Counts/GSE153315_raw_counts_GRCh38.p13_NCBI.tsv.gz", delim = "\t")
+
+GSE153315_outliers <- find_outliers(GSE153315_counts %>%
+
+  column_to_rownames("GeneID") %>%
+  filter_all(any_vars(. != 0)) %>% # filter all-zero rows
+  drop_na(), concordance_measure = 2)
+
+GSE153315_meta <- read.csv("Meta/GSE153315_SraRunTable.csv") %>% transmute(disease) %>% table
+  transmute(sample = Sample.Name, sex = gender, age = AGE, condition = ifelse(str_detect(disease, 'Diabetes'), 'T2D', 'Health')) %>% 
+  # mutate(age_scaled = scale(age, center = TRUE, scale = TRUE)) %>% 
+  mutate(age_cat = ifelse(age < 50, 'young', 'old')) %>% 
+  filter(!sample %in% GSE153315_outliers) # remove outliers
+
+GSE153315_dream <- dream_analysis(GSE153315_counts, GSE153315_meta, ~ 0 + condition + sex, "conditionT2D - conditionHealth")
+
+GSE153315_dream_res <- topTable(GSE153315_dream, coef = "Test1", number = Inf) %>% 
+  as.data.frame()
+```
+# GSE184050
+```{r}
+GSE184050_counts <- read_delim("Counts/GSE184050_raw_counts_GRCh38.p13_NCBI.tsv.gz", delim = "\t")
+
+GSE184050_meta <- read.csv("Meta/GSE184050_SraRunTable.csv") %>%
+  
+  transmute(sample = Sample.Name, sex, age, condition = ifelse(str_detect(disease_state, 'T2D'), 'T2D', 'Health'), timepoint, individual = factor(individual)) %>%
+  filter(sample != "GSM5576811") %>% # filter sample w/o counts
+  mutate(age_cat = ifelse(age < 50, 'young', 'old')) %>% 
+  filter(!sample %in% GSE184050_outliers) # remove outliers
+
+GSE184050_dream <- dream_analysis(GSE184050_counts, GSE184050_meta, ~ 0 + condition + sex + timepoint + (1 | individual), "conditionT2D - conditionHealth")
+
+GSE184050_dream_res <- topTable(GSE184050_dream, coef = "Test1", number = Inf) %>% 
+  as.data.frame()
+```
+# GSE221521
+```{r}
+GSE221521_counts <- read_delim("Counts/GSE221521_raw_counts_GRCh38.p13_NCBI.tsv.gz", delim = "\t")
+
+GSE221521_outliers <- find_outliers(GSE221521_counts %>%
+
+  column_to_rownames("GeneID") %>%
+  filter_all(any_vars(. != 0)) %>% # filter all-zero rows
+  drop_na(), concordance_measure = 2)
+
+GSE221521_meta <- read.csv("Meta/GSE221521_SraRunTable.csv") %>% 
+  left_join(read_tsv("Meta/GSE221521_sample_data.tsv"), by = c("Sample.Name" = "sample")) %>% 
+  filter(!str_detect(description, "DR")) %>% 
+  transmute(sample = Sample.Name, condition = ifelse(str_detect(description, 'DM'), 'T2D', 'Health')) %>% 
+
+  filter(!sample %in% GSE221521_outliers) # remove outliers
+
+# infer sex
+
+GSE221521_meta <- infer_sex(GSE221521_counts, GSE221521_meta)
+
+GSE221521_dream <- dream_analysis(GSE221521_counts, GSE221521_meta, ~ 0 + condition + sex, "conditionT2D - conditionHealth")
+
+GSE221521_dream_res <- topTable(GSE221521_dream, coef = "Test1", number = Inf) %>% 
+  as.data.frame()
+```
+# GSE185011
+```{r}
+GSE185011_counts <- read_delim("Counts/GSE185011_raw_counts_GRCh38.p13_NCBI.tsv.gz", delim = "\t")
+
+GSE185011_outliers <- find_outliers(GSE185011_counts %>%
+
+  column_to_rownames("GeneID") %>%
+  filter_all(any_vars(. != 0)) %>% # filter all-zero rows
+  drop_na(), concordance_measure = 2)
+
+GSE185011_meta <- read.csv("Meta/GSE185011_SraRunTable.csv") %>% 
+  left_join(read_tsv("Meta/GSE185011_sample_data.tsv"), by = c("Sample.Name" = "sample")) %>%
+  filter(str_detect(description, "HC|T2DM")) %>% 
+  transmute(sample = Sample.Name, age = AGE, condition = ifelse(str_detect(description, 'DM'), 'T2D', 'Health')) %>% 
+  mutate(age = str_extract(age, "[0-9]+") %>% as.numeric()) %>% 
+  mutate(age_cat = ifelse(age < 50, 'young', 'old')) %>% 
+  filter(!sample %in% GSE185011_outliers) # remove outliers
+  # mutate(age_scaled = scale(age, center = TRUE, scale = TRUE))
+
+# infer sex
+GSE185011_meta <- infer_sex(GSE185011_counts, GSE185011_meta)
+
+GSE185011_dream <- dream_analysis(GSE185011_counts, GSE185011_meta, ~ 0 + condition + sex, "conditionT2D - conditionHealth")
+
+GSE185011_dream_res <- topTable(GSE185011_dream, coef = "Test1", number = Inf) %>% 
+  as.data.frame()
+
+```
+# GSE181143
+```{r}
+GSE181143_counts <- read_delim("Counts/GSE181143_raw_counts_GRCh38.p13_NCBI.tsv.gz", delim = "\t")
+
+GSE181143_outliers <- find_outliers(GSE181143_counts %>% 
+  column_to_rownames("GeneID") %>% 
+  filter_all(any_vars(. != 0)) %>% # filter all-zero rows
+  drop_na(), concordance_measure = 2)
+
+
+GSE181143_meta <- read.csv("Meta/GSE181143_SraRunTable.csv") %>%
+  transmute(sample = Sample.Name, sex, condition = ifelse(!str_detect(disease_state, 'non'), 'T2D', 'Health'), tb_status, timepoint = factor(timepoint), donor_id, Site)
+
+# infer sex where not available
+orphan_samples <- GSE181143_meta %>% 
+  filter(!str_detect(sex, "male"))
+
+sex_table <- GSE181143_counts %>% 
+  filter(GeneID == 8284 | GeneID == 7503) %>% 
+  pivot_longer(cols = starts_with("GSM")) %>% 
+  pivot_wider(names_from = GeneID, values_from = value) %>% 
+  mutate(sex = ifelse(`7503` > `8284`, 'female', 'male'))
+
+# Sex inference produces some discrepancies
+GSE181143_meta <- GSE181143_meta %>% 
+  left_join(sex_table, by=c('sample' = 'name')) %>% 
+  transmute(sample, sex0 = sex.x, sex = sex.y, condition, tb_status, timepoint, donor_id, Site)
+
+GSE181143_meta <- GSE181143_meta %>% 
+  filter(!sample %in% GSE181143_outliers) # remove outliers
+  
+remove(sex_table, orphan_samples)
+
+GSE181143_dream <- dream_analysis(GSE181143_counts, GSE181143_meta, ~ 0 + condition + sex + tb_status + timepoint + Site + (1 | donor_id), "conditionT2D - conditionHealth")
+
+GSE181143_dream_res <- topTable(GSE181143_dream, coef = "Test1", number = Inf) %>% 
+  as.data.frame()
+
+```
+# GSE114192
+```{r}
+GSE114192_counts <- read_delim("Counts/GSE114192_raw_counts_GRCh38.p13_NCBI.tsv.gz", delim = "\t")
+
+GSE114192_outliers <- find_outliers(GSE114192_counts %>% 
+  
+  column_to_rownames("GeneID") %>% 
+  filter_all(any_vars(. != 0)) %>% # filter all-zero rows
+  drop_na(), concordance_measure = 2)
+
+GSE114192_meta <- read.csv("Meta/GSE114192_SraRunTable.csv") %>% 
+  left_join(read_tsv("Meta/GSE114192_sample_data.tsv"), by = c("Sample.Name" = "sample")) %>%
+  filter(!str_detect(description, "IH")) %>% 
+  transmute(sample = Sample.Name, condition = ifelse(str_detect(description, 'DM'), 'T2D', 'Health'), tb_status = ifelse(str_detect(description, 'TB'), 'TB', 'nonTB'), field_site)
+
+# infer sex
+GSE114192_meta <- infer_sex(GSE114192_counts, GSE114192_meta)
+  transmute(sample, sex, condition, tb_status, field_site) %>% 
+  filter(!sample %in% GSE114192_outliers) # remove outliers
+
+GSE114192_meta <- GSE114192_meta %>% 
+    drop_na()  # One sample is missing from counts file (probs due to low mapping rate)
+
+GSE114192_dream <- dream_analysis(GSE114192_counts, GSE114192_meta, ~ 0 + condition + sex + tb_status + field_site, "conditionT2D - conditionHealth")
+
+GSE114192_dream_res <- topTable(GSE114192_dream, coef = "Test1", number = Inf) %>% 
+  as.data.frame()
+```
+
+# Do some comparisons
+```{r}
+dataset_names <- c("GSE280402", "GSE154881", "GSE153315", "GSE184050", "GSE221521", "GSE185011", "GSE181143", "GSE114192")
+
+combined_results <- combine_tibbles_with_names(
+  dataset_names,
+  our_dream_res,
+  GSE154881_dream_res,
+  GSE153315_dream_res,
+  GSE184050_dream_res,
+  GSE221521_dream_res,
+  GSE185011_dream_res,
+  GSE181143_dream_res,
+  GSE114192_dream_res)
+```
+
+```{r}
+comparison_results <- combined_results %>%
+  mutate(log2FoldChange = ifelse(is.na(logFC), 0, logFC),
+         padj = ifelse(is.na(adj.P.Val), 1, adj.P.Val)) %>% 
+  mutate(significant = adj.P.Val < 0.05,
+         direction = ifelse(log2FoldChange > 0, "Up", "Down")) %>%
+  group_by(GeneID) %>%
+  summarise(
+    n_sig = sum(significant),
+    n_up = sum(significant & direction == "Up"),
+    n_down = sum(significant & direction == "Down"),
+    mean_logFC = mean(log2FoldChange),
+    sd_logFC = sd(log2FoldChange),
+    median_pvalue = median(padj)
+  ) %>%
+  arrange(desc(n_sig), sd_logFC)
+
+consistent_genes <- comparison_results %>%
+  filter(n_sig >= 2) %>%  # At least 2 cohorts show significance
+  arrange(desc(n_sig), sd_logFC)
+
+```
+# Fig2
+```{r}
+combined_counts <- GSE114192_counts %>% 
+  left_join(our_counts, by = "GeneID") %>% 
+  left_join(GSE153315_counts, by = "GeneID") %>% 
+  left_join(GSE154881_counts, by = "GeneID") %>% 
+  left_join(GSE181143_counts, by = "GeneID") %>% 
+  left_join(GSE184050_counts, by = "GeneID") %>% 
+  left_join(GSE185011_counts, by = "GeneID") %>% 
+  left_join(GSE221521_counts, by = "GeneID") %>%
+  na.omit()
+
+combined_meta <- bind_rows(list(our = our_meta, 
+                           GSE114192 = GSE114192_meta, 
+                           GSE153315 = GSE153315_meta, 
+                           GSE154881 = GSE154881_meta, 
+                           GSE181143 = GSE181143_meta, 
+                           GSE184050 = GSE184050_meta, 
+                           GSE185011 = GSE185011_meta, 
+                           GSE221521 = GSE221521_meta), .id = "dataset") %>% 
+  dplyr::select(sample, sex, condition, dataset)
+
+
+combined_dds <- DESeqDataSetFromMatrix(combined_counts %>% 
+                                  dplyr::select(GeneID, any_of(combined_meta$sample)) %>% 
+                                  column_to_rownames('GeneID') %>% 
+                                  as.matrix(), 
+                                combined_meta, design = ~ sex + condition + dataset)
+  
+combined_dds <- DESeq(combined_dds)
+  
+combined_vsd <- varianceStabilizingTransformation(combined_dds)
+
+combined_biplot <- plotPCA(combined_vsd, intgroup = "dataset", returnData = T) %>% 
+  mutate(dataset = dataset %>% str_replace("our", "GSE280402")) %>% 
+  ggplot(aes(PC1, PC2, color = dataset))+
+  geom_point()+
+  theme_bw()
+
+logFC_data <- combined_results %>%
+  dplyr::select(GeneID, cohort, logFC) %>%
+  pivot_wider(names_from = cohort, values_from = logFC) %>%
+  dplyr::select(-GeneID) %>% 
+  mutate_all(~ replace_na(., 0))
+
+cor_result <- rcorr(as.matrix(logFC_data), type = "pearson")
+
+logFC_correlations <- cor_result$r
+pval_matrix <- cor_result$P
+
+create_sig_matrix <- function(pval_matrix) {
+  sig_matrix <- matrix("", nrow = nrow(pval_matrix), ncol = ncol(pval_matrix))
+  
+  for (i in 1:nrow(pval_matrix)) {
+    for (j in 1:ncol(pval_matrix)) {
+      if (!is.na(pval_matrix[i, j])) {
+        if (pval_matrix[i, j] < 0.001) {
+          sig_matrix[i, j] <- "***"
+        } else if (pval_matrix[i, j] < 0.01) {
+          sig_matrix[i, j] <- "**"
+        } else if (pval_matrix[i, j] < 0.05) {
+          sig_matrix[i, j] <- "*"
+        } else {
+          sig_matrix[i, j] <- ""  
+        }
+      }
+    }
+  }
+  return(sig_matrix)
+}
+
+sig_matrix <- create_sig_matrix(pval_matrix)
+
+# Combine correlation values with significance stars for display
+display_matrix <- matrix(
+  paste0(sprintf("%.2f", logFC_correlations), "\n", sig_matrix),
+  nrow = nrow(logFC_correlations),
+  ncol = ncol(logFC_correlations)
+)
+rownames(display_matrix) <- rownames(logFC_correlations)
+colnames(display_matrix) <- colnames(logFC_correlations)
+
+# Create the heatmap
+logFC_corr <- pheatmap::pheatmap(logFC_correlations,
+         color = colorRampPalette(c("blue", "white", "red"))(100),
+         display_numbers = display_matrix,
+         number_format = "%s",  
+         number_color = "black",
+         cluster_rows = FALSE,
+         cluster_cols = FALSE,
+         main = "Correlation of Log2 Fold Changes Across Cohorts\n(*p<0.05, **p<0.01, ***p<0.001)",
+         border_color = NA,
+         fontsize = 10,
+         fontsize_number = 8,  
+         breaks = seq(-1, 1, length.out = 101),  # Force color mapping from -1 to 1
+         legend_breaks = c(-1, -0.5, 0, 0.5, 1),
+         legend_labels = c("-1.0", "-0.5", "0", "0.5", "1.0"))
+
+top_genes <- combined_results %>%
+  filter(adj.P.Val < 0.05) %>%
+  group_by(cohort) %>%
+  arrange(desc(logFC)) %>%
+  mutate(rank_positive = row_number()) %>%
+  arrange(logFC) %>%
+  mutate(rank_negative = row_number()) %>%
+  filter(rank_positive <= 5 | rank_negative <= 5) %>%
+  ungroup() %>% 
+  left_join(annotation, by = "GeneID")
+
+combined_volcano <- combined_results %>%
+  ggplot(aes(x = logFC, y = -log10(adj.P.Val))) +
+  geom_point(aes(color = case_when(
+    adj.P.Val < 0.05 & logFC > 0 ~ "Significant Positive",
+    adj.P.Val < 0.05 & logFC < 0 ~ "Significant Negative",
+    TRUE ~ "Not Significant"
+  )), alpha = 0.5) +
+  scale_color_manual(values = c(
+    "Significant Positive" = "red",
+    "Significant Negative" = "blue",
+    "Not Significant" = "grey"
+  )) +
+  geom_text_repel(data = top_genes, 
+                  aes(label = Symbol, 
+                      color = ifelse(logFC > 0, "Significant Positive", "Significant Negative")),
+                  size = 3,
+                  max.overlaps = Inf,  
+                  min.segment.length = 0,  
+                  box.padding = 0.5,  
+                  show.legend = FALSE) +
+  facet_wrap(~cohort) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  ggtitle("Volcano Plots Across Cohorts") +
+  theme_bw() +
+  labs(color = "Significance")
+
+up_down_plot <- comparison_results %>%
+  mutate(up = n_up, down = n_down) %>% 
+  pivot_longer(cols = c(up, down), 
+               names_to = "direction", 
+               values_to = "count") %>%
+  filter(count > 0) %>% 
+  count(direction, count) %>%
+  ggplot(aes(x = count, y = ifelse(direction == "up", n, -n), fill = direction)) +
+  geom_col(position = "identity", alpha = 0.7) +
+  geom_text(aes(label = n, 
+                
+                y = ifelse(direction == "up", n + 700, -n - 700)), 
+            size = 3.5, 
+            nudge_y = 0.5, 
+            color = "black") +
+  scale_fill_manual(values = c("up" = "red", "down" = "blue")) +
+  labs(y = "Number of genes", x = "Amount of studies where a gene is differentially expressed", fill = "Direction") +
+  theme_bw()
+
+
+combined_biplot <- plotPCA(combined_vsd, intgroup = "dataset", returnData = T) %>% 
+  mutate(dataset = dataset %>% str_replace("our", "GSE280402")) %>% 
+  ggplot(aes(PC1, PC2, color = dataset))+
+  geom_point()+
+  theme_bw()
+
+
+## Figure 2
+
+pdf("Fig2.pdf", 20, 10)
+
+ggpubr::ggarrange(logFC_corr[[4]], combined_volcano, up_down_plot, combined_biplot, labels = "AUTO")
+
+dev.off()
+```
+
+
+
+# metaRNA-seq, Fig3
+```{r}
+
+pvals_to_meta <- combined_results %>% 
+  transmute(GeneID, P.Value, cohort) %>% 
+  mutate(P.Value = ifelse(is.na(P.Value), 1, P.Value)) %>% 
+  pivot_wider(names_from = cohort, values_from = P.Value) %>% 
+  mutate_all(~ replace_na(., 1)) %>% 
+  column_to_rownames('GeneID') %>% 
+  as.list()
+
+n_reps_to_meta <- names(pvals_to_meta) %>% 
+  sapply(str_split_i, pattern='_', i=1) %>% 
+  str_replace("GSE280402", "our") %>% 
+  paste0("_meta") %>% 
+  get_row_counts()
+
+meta_results <- invnorm(pvals_to_meta, n_reps_to_meta, BHth = 0.05)
+
+meta_de <- combined_results %>% 
+  transmute(GeneID, P.Value, cohort) %>% 
+  mutate(P.Value = ifelse(is.na(P.Value), 1, P.Value)) %>%
+  pivot_wider(names_from = cohort, values_from = P.Value) %>%  
+  transmute(GeneID, padj = meta_results$adjpval, test_stat = meta_results$TestStatistic) %>% 
+  filter(padj < 0.05) %>% 
+  pull(GeneID)
+
+studywise_de <- combined_results %>% 
+  transmute(GeneID, adj.P.Val, cohort) %>% 
+  mutate(adj.P.Val = ifelse(is.na(adj.P.Val), 1, adj.P.Val)) %>% 
+  filter(adj.P.Val < 0.05) %>% 
+  mutate(adj.P.Val = GeneID) %>% 
+  pivot_wider(names_from = cohort, values_from = adj.P.Val) %>% 
+  
+  column_to_rownames('GeneID') %>% 
+  as.list() %>% 
+  lapply(na.omit)
+
+
+IDD.IRR(meta_de, studywise_de)
+
+
+retained_plot <- combined_results %>% 
+  transmute(GeneID, adj.P.Val, cohort) %>% 
+  mutate(adj.P.Val = ifelse(is.na(adj.P.Val), 1, adj.P.Val)) %>% 
+  filter(adj.P.Val < 0.05) %>% 
+  mutate(in_meta = ifelse(GeneID %in% meta_de, T, F)) %>% 
+  ggplot(aes(x = cohort, fill = in_meta)) +
+  geom_histogram(stat = "count", position = "stack") +
+  stat_count(geom = "text", aes(label = after_stat(count), group = in_meta),
+             position = position_stack(vjust = 0.5), color = "black", size = 3) +
+  scale_fill_brewer(palette = "Set1", 
+                    name = "Genes in meta-analysis",
+                    labels = c("FALSE" = "Not retained in meta", "TRUE" = "Retained in meta")) +
+  labs(title = "Significant Genes by Cohort and Meta-analysis Status",
+       x = "Cohort",
+       y = "Count of Significant Genes") +
+  theme_minimal()
+
+IDD_genes <- combined_results %>% 
+  transmute(GeneID, adj.P.Val, cohort) %>% 
+  mutate(adj.P.Val = ifelse(is.na(adj.P.Val), 1, adj.P.Val)) %>% 
+  filter(adj.P.Val < 0.05) %>% 
+  pivot_wider(names_from = cohort, values_from = adj.P.Val) %>% 
+  pull(GeneID) %>% 
+  setdiff(meta_de, .)
+
+# Custom homogeneity for logFC
+homogeneity_score <- function(x) 
+{
+  # Handle the trivial case of an empty vector
+  if (length(x) == 0) {
+    return(NaN)
+  }
+  
+  # 1. Determine the dominant sign and its proportion
+  prop_positive <- mean(x > 0)
+  prop_negative <- mean(x < 0)
+  prop_zero <- mean(x == 0)
+  
+  positive_sum = sum(x[x > 0])
+  negative_sum = abs(sum(x[x < 0]))
+  
+  
+  # Find which sign is dominant and its proportion of non-zero values
+  if (prop_positive > prop_negative) {
+    dominant_sign <- 1
+    sign_agreement <- prop_positive
+  } else if (prop_negative > prop_positive) {
+    dominant_sign <- -1
+    sign_agreement <- prop_negative
+  } else {
+    # Exactly equal positive and negative (or all zeros)
+    # Default to positive sign but with minimal agreement
+    dominant_sign <- ifelse(positive_sum > negative_sum, 1, -1)
+    sign_agreement <- 0.5
+  }
+  
+  # 2. Magnitude Homogeneity Component (using CV of absolute values)
+  abs_x <- abs(x)
+  if (all(abs_x == 0)) {
+    # All values are zero - perfect magnitude homogeneity but no dominant sign
+    magnitude_dispersion <- 0
+    # Override: for all zeros, we consider it perfectly homogeneous but neutral
+    return(0)
+  } else {
+    magnitude_dispersion <- sd(abs_x) / mean(abs_x)
+  }
+  
+  # Invert dispersion so 1 is perfectly homogeneous, 0 is perfectly heterogeneous
+  magnitude_homogeneity <- 1 / (1 + magnitude_dispersion)
+  
+  # 3. Combine the components
+
+  base_score <- sign_agreement * magnitude_homogeneity
+  
+  # 4. Apply the dominant sign and scale to allow for large values
+
+  signed_score <- dominant_sign * log(1 + base_score)
+  
+  return(signed_score)
+}
+
+agreement_score <- function(x)
+{
+    if (!is.numeric(x)) {
+    stop("Input must be a numeric vector")
+  }
+  
+  # Remove NA values
+  x_clean <- x[!is.na(x)]
+  positive_sum = sum(x_clean[x_clean > 0])
+  negative_sum = abs(sum(x_clean[x_clean < 0]))
+  # Count positive and negative values
+  positive_count <- sum(x_clean > 0)
+  negative_count <- sum(x_clean < 0)
+  zero_count <- sum(x_clean == 0)
+  total_non_na <- length(x_clean)
+
+  
+  if(positive_count == negative_count)
+  {
+     return(ifelse(positive_sum >= negative_sum, positive_count, - negative_count))
+  }
+  
+  return(ifelse(positive_count > negative_count, positive_count, - negative_count))
+}
+
+
+# Meta volcano
+meta_pvals <- combined_results %>% 
+  transmute(GeneID, P.Value, cohort) %>% 
+  mutate(P.Value = ifelse(is.na(P.Value), 1, P.Value)) %>%
+  pivot_wider(names_from = cohort, values_from = P.Value) %>%  
+  transmute(GeneID, padj = meta_results$adjpval, test_stat = meta_results$TestStatistic)
+
+meta_logfcs <- combined_results %>% 
+  transmute(GeneID, logFC, cohort) %>% 
+  mutate(logFC = ifelse(is.na(logFC), 0, logFC)) %>%
+  group_by(GeneID) %>% 
+  summarise(homo_score = homogeneity_score(logFC),
+            ag_score = agreement_score(logFC))
+
+meta_de_volcano <- meta_pvals %>% 
+  left_join(meta_logfcs, by = "GeneID") %>% 
+  ggplot(aes(x = homo_score, y = -log10(padj)))+
+  geom_point(aes(color = case_when(
+    padj < 0.05 & homo_score > 0 ~ "Significant Positive",
+    padj < 0.05 & homo_score < 0 ~ "Significant Negative",
+    TRUE ~ "Not Significant"
+  )), alpha = 0.5) +
+  scale_color_manual(values = c(
+    "Significant Positive" = "red",
+    "Significant Negative" = "blue",
+    "Not Significant" = "grey"
+  )) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  ggtitle("metaRNAseq analysis results")+
+  labs(x = "Homogeneity score for logFC")+
+  guides(color="none")+
+  theme_bw()
+
+IDD_volcano <- meta_pvals %>% 
+  left_join(meta_logfcs, by = "GeneID") %>% 
+  filter(GeneID %in% IDD_genes) %>% 
+  ggplot(aes(x = homo_score, y = -log10(padj))) +
+  geom_point(aes(color = ag_score), alpha = 0.5) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  # Add text labels only for ag_score > 6
+  geom_text(aes(x = homo_score, y = -log10(padj), label = Symbol),
+            data = meta_pvals %>% 
+                  left_join(meta_logfcs, by = "GeneID") %>% 
+                  filter(GeneID %in% IDD_genes) %>% 
+                  filter(ag_score > 7 | ag_score < -7) %>% 
+                  left_join(annotation, by = "GeneID"))+
+  ggtitle("Integration-driven discoveries") +
+  labs(x = "Homogeneity score for logFC") +
+  guides(color = guide_legend(title = "Concordance in logFC")) +
+  theme_bw() +
+  scale_color_gradient2(
+    low = "blue",        # Negative values
+    mid = "white",       # Zero values
+    high = "red",        # Positive values
+    midpoint = 0,        # Center the gradient at zero
+    name = "Concordance in logFC"
+  )
+
+pdf("Fig3.pdf", 20, 15)
+
+ggpubr::ggarrange(meta_de_volcano, IDD_volcano, retained_plot, labels = "AUTO")
+
+dev.off()
+```
+
+# Enrichment, Fig4, S9
+```{r}
+run_enrichment <- function(dream_res)
+{
+
+  sign_res <- dream_res %>% 
+    filter(adj.P.Val < 0.05) %>% 
+    rownames_to_column("ENTREZID")
+  
+  sign_up <- sign_res %>% 
+    filter(logFC > 0)
+  
+  sign_dw <- sign_res %>% 
+    filter(logFC < 0)
+  
+  
+  KEGG_dw <- enrichKEGG(sign_dw$ENTREZID, organism = "hsa", universe = annotation$GeneID)
+  KEGG_up <- enrichKEGG(sign_up$ENTREZID, organism = "hsa", universe = annotation$GeneID)
+  
+  GO_up <- enrichGO(sign_up$ENTREZID, "org.Hs.eg.db", keyType = "ENTREZID", ont = "ALL", universe = annotation$GeneID)
+  GO_dw <- enrichGO(sign_dw$ENTREZID, "org.Hs.eg.db", keyType = "ENTREZID", ont = "ALL", universe = annotation$GeneID)
+  
+  ranks_for_gsea <- dream_res %>% 
+  as.data.frame() %>%   
+  na.omit() %>% 
+  arrange(desc(t)) %>% 
+  rownames_to_column("gene_id") %>%
+  transmute(gene_id, t) %>% 
+  deframe()
+
+  GO_gsea <- gseGO(ranks_for_gsea, ont = "ALL", "org.Hs.eg.db", eps = 0)
+  
+  return(list(GO_dw = GO_dw, GO_up = GO_up, KEGG_up = KEGG_up, KEGG_dw = KEGG_dw, GO_gsea = GO_gsea))
+}
+
+enrich_IDD <- enrichGO(IDD_genes, "org.Hs.eg.db", keyType = "ENTREZID", ont = "ALL")
+
+enrich_meta <- enrichGO(meta_de, "org.Hs.eg.db", keyType = "ENTREZID", ont = "ALL")
+
+# enrich with hallmarks and CP
+msigdb.hs = getMsigdb(org = 'hs', id = 'SYM', version = '7.4')
+hallmarks = subsetCollection(msigdb.hs, 'h')
+cp = subsetCollection(msigdb.hs, paste0('c', 1:8))
+
+
+cp_human_t2g = msigdbr(species = "human", category = "C2") %>% 
+       dplyr::filter(gs_subcat != 'CGP') %>%
+       dplyr::distinct(gs_name, gene_symbol) %>% 
+       as.data.frame()
+
+
+H_TERM2GENE <- geneIds(hallmarks) %>% 
+  enframe(name = "term", value = "gene") %>%
+  unnest(gene)
+
+CP_TERM2GENE <- geneIds(cp) %>% 
+  enframe(name = "term", value = "gene") %>%
+  unnest(gene)
+
+enrich_IDD_H <- enricher(annotation %>% 
+  filter(GeneID %in% IDD_genes) %>% 
+    pull(Symbol), TERM2GENE = H_TERM2GENE)
+
+enrich_IDD_CP <- enricher(annotation %>% 
+  filter(GeneID %in% IDD_genes) %>% 
+    pull(Symbol), TERM2GENE = cp_human_t2g)
+
+enrich_meta_H <- enricher(annotation %>% 
+  filter(GeneID %in% meta_de) %>% 
+    pull(Symbol), TERM2GENE = H_TERM2GENE)
+
+enrich_meta_CP <- enricher(annotation %>% 
+  filter(GeneID %in% meta_de) %>% 
+    pull(Symbol), TERM2GENE = cp_human_t2g)
+
+
+pdf("Fig4.pdf", 20, 15)
+
+ggpubr::ggarrange(dotplot(enrich_meta)+ggtitle("GO terms enriched in meta-analysis DEGs"),
+                  enrich_meta %>% 
+  
+                  filter(ID %in% setdiff(meta_GO_categories, combined_GO_categories)) %>% 
+                  dotplot + ggtitle("GO terms enriched exclusively in meta-analysis DEGs"),
+                  dotplot(enrich_IDD)+ggtitle("GO terms enriched in integration-driven discoveries"), labels = "AUTO")
+
+dev.off()
+
+pdf("S9.pdf", 20, 15)
+
+ggpubr::ggarrange(dotplot(enrich_meta_CP)+ggtitle("Canonical pathways enriched in meta-analysis DEGs"), 
+                  dotplot(enrich_meta_H)+ggtitle("Hallmark pathways enriched in meta-analysis DEGs"), labels = "AUTO")
+
+dev.off()
+
+our_enrichment <- run_enrichment(our_dream_res)
+GSE114192_enrichment <- run_enrichment(GSE114192_dream_res) 
+GSE153315_enrichment <- run_enrichment(GSE153315_dream_res)
+GSE154881_enrichment <- run_enrichment(GSE154881_dream_res)
+GSE181143_enrichment <- run_enrichment(GSE181143_dream_res)
+GSE184050_enrichment <- run_enrichment(GSE184050_dream_res)
+GSE185011_enrichment <- run_enrichment(GSE185011_dream_res)
+GSE221521_enrichment <- run_enrichment(GSE221521_dream_res)
+
+```
+
+# Deconvo part, Fig5, S10
+```{r}
+GSE114192_tpm <- read_delim("TPM/GSE114192_norm_counts_TPM_GRCh38.p13_NCBI.tsv.gz", delim = "\t")
+GSE153315_tpm <- read_delim("TPM/GSE153315_norm_counts_TPM_GRCh38.p13_NCBI.tsv.gz", delim = "\t")
+GSE154881_tpm <- read_delim("TPM/GSE154881_norm_counts_TPM_GRCh38.p13_NCBI.tsv.gz", delim = "\t")
+GSE181143_tpm <- read_delim("TPM/GSE181143_norm_counts_TPM_GRCh38.p13_NCBI.tsv.gz", delim = "\t")
+GSE184050_tpm <- read_delim("TPM/GSE184050_norm_counts_TPM_GRCh38.p13_NCBI.tsv.gz", delim = "\t")
+GSE185011_tpm <- read_delim("TPM/GSE185011_norm_counts_TPM_GRCh38.p13_NCBI.tsv.gz", delim = "\t")
+GSE221521_tpm <- read_delim("TPM/GSE221521_norm_counts_TPM_GRCh38.p13_NCBI.tsv.gz", delim = "\t")
+GSE231509_tpm <- read_delim("TPM/GSE231509_norm_counts_TPM_GRCh38.p13_NCBI.tsv.gz", delim = "\t")
+
+
+combine_tsv_tpm <- function(folder_path) 
+{
+  # Get list of TSV files in the folder
+  file_list <- list.files(path = folder_path, pattern = "\\.featureCounts$", full.names = TRUE)
+  
+  # Check if there are any files
+  if (length(file_list) == 0) {
+    stop("No files found in the specified folder")
+  }
+
+  renamer_fun <- function(string)
+  {
+  string %>% str_split_i("/", 4) %>% str_split_i("_", 1) %>% 
+    str_replace("Drib", "T2D000") %>% str_replace("Oneg", "K000")
+  }
+  
+  get_tpm <- function(file)
+  {
+    df <- read_tsv(file, comment = "#", show_col_types = FALSE)
+    
+    df <- df %>% 
+      mutate(Length_kb = Length / 1000) %>% 
+      
+      mutate_at(colnames(df) %>% str_subset("bam"), list(RPK =  ~ . / Length_kb))
+    
+    scaling_factor <- sum(df$RPK) / 1e6
+    
+    df <- df %>%
+      mutate_at(colnames(df) %>% str_subset("bam"),  list(~ RPK / scaling_factor))
+    
+    df %>% 
+      transmute(Geneid, across(colnames(df) %>% str_subset("bam"), ~ .))
+  }
+  
+  combine_df <- function(df1, df2)
+  {
+  df1 %>%
+      inner_join(df2,
+               by = "Geneid")
+  }
+
+  
+  # Read all files into a list of data frames
+  
+  df_list <- map(file_list, get_tpm)
+  
+  purrr::reduce(df_list, combine_df) %>% rename_with(~ renamer_fun(.x), ends_with("bam"))
+  
+
+}
+
+our_tpm <- combine_tsv_tpm("Counts/Our_data/") %>% 
+  rename(Symbol = Geneid) %>% 
+  left_join(annotation, by = "Symbol") %>% 
+  drop_na() %>% 
+  dplyr::select(-Symbol)
+
+combined_tpm <- GSE114192_tpm %>% 
+  left_join(our_tpm, by = "GeneID") %>% 
+  left_join(GSE153315_tpm, by = "GeneID") %>% 
+  left_join(GSE154881_tpm, by = "GeneID") %>% 
+  left_join(GSE181143_tpm, by = "GeneID") %>% 
+  left_join(GSE184050_tpm, by = "GeneID") %>% 
+  left_join(GSE185011_tpm, by = "GeneID") %>% 
+  left_join(GSE221521_tpm, by = "GeneID") %>% 
+  mutate(GeneID = as.character(GeneID)) %>% 
+  na.omit()
+
+tpm_matrix <- combined_tpm %>% 
+  dplyr::select(GeneID, any_of(combined_meta$sample)) %>% 
+  left_join(annotation, by = 'GeneID') %>% 
+  dplyr::select(-GeneID) %>% 
+  group_by(Symbol) %>% 
+  summarise(across(everything(), sum)) %>% 
+  column_to_rownames("Symbol") %>% 
+  as.matrix()
+
+combined_deconv <- immunedeconv::deconvolute(tpm_matrix, "quantiseq")
+
+pdf("S10.pdf", 20, 15)
+
+combined_deconv %>%
+  gather(sample, fraction, -cell_type) %>%
+  left_join(combined_meta, by = "sample") %>% 
+  # plot as stacked bar chart
+  mutate(condition = condition %>% str_replace("Obesity", "Health") %>% str_replace("Health", "Healthy")) %>% 
+  ggplot(aes(x = sample, y = fraction, fill = cell_type)) +
+  
+  facet_wrap( condition ~ dataset, scales = "free", axis = "all_y") +
+  geom_bar(stat = "identity") +
+  ylim(0, 1) +
+  coord_flip() +
+  scale_fill_brewer(palette = "Paired") +
+  theme_bw() +
+  theme(axis.title.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank())
+
+dev.off()
+
+
+heatmap_data <- combined_deconv %>%
+  gather(sample, fraction, -cell_type) %>%
+  left_join(combined_meta, by = "sample") %>% 
+  mutate(condition = condition %>% str_replace("Obesity", "Health") %>% str_replace("Health", "Healthy")) %>% 
+  mutate(dataset = dataset %>% str_replace("our", "GSE280402")) %>% 
+  group_by(dataset, condition, cell_type) %>% 
+  summarise(median = median(fraction)) %>%
+  ungroup() %>%
+  pivot_wider(names_from = c(dataset, condition), values_from = median) %>%
+  column_to_rownames("cell_type") %>%
+  as.matrix()
+
+col_meta <- data.frame(
+  colname = colnames(heatmap_data),
+  dataset = gsub("_(Healthy|.*)$", "", colnames(heatmap_data)),
+  condition = gsub("^.*_", "", colnames(heatmap_data))
+)
+
+col_anno <- HeatmapAnnotation(
+  df = data.frame(
+    Dataset = col_meta$dataset,
+    Condition = col_meta$condition
+  ),
+  which = "column",
+  annotation_name_side = "left",
+  show_legend = TRUE
+)
+
+ht <- Heatmap(
+  heatmap_data,
+  name = "Cell type fraction",
+  col = colorRamp2(seq(0, 1, length.out = 11), rev(brewer.pal(11, "RdBu"))),
+  column_split = factor(col_meta$dataset, levels = unique(col_meta$dataset)),
+  cluster_columns = TRUE,
+  column_title = NULL,
+  cluster_rows = TRUE,
+  row_names_side = "left",
+  top_annotation = col_anno,
+  rect_gp = gpar(col = "white", lwd = 0.5),
+  show_column_names = FALSE,
+  row_names_gp = gpar(fontsize = 10),
+  column_names_gp = gpar(fontsize = 8),
+  heatmap_legend_param = list(
+    title = "Cell type fraction",
+    legend_height = unit(4, "cm"),
+    at = seq(0, 1, 0.2)
+  )
+)
+
+pdf("Fig5.pdf", 20, 15)
+
+draw(ht, 
+     column_title = "Cell Type Fractions by Dataset and Condition",
+     column_title_gp = gpar(fontsize = 14, fontface = "bold"),
+     heatmap_legend_side = "right")
+
+dev.off()
+```
+
+# Proportion testing
+```{r}
+propDream <- voomWithDreamWeights(combined_deconv %>% 
+                           column_to_rownames("cell_type"), ~ sex + condition + (1 | dataset), combined_meta)
+
+proportions_fit <- dream(propDream, ~ sex + condition + (1 | dataset), combined_meta)
+proportions_fit <- eBayes(proportions_fit)
+
+topTable(proportions_fit, coef = "conditionT2D", number = Inf)
+```
+
+# Find top genes in each sample, S11
+```{r}
+
+top_5_genes <- combined_tpm %>% 
+  pivot_longer(cols = -GeneID, names_to = "Sample", values_to = "Expression") %>% 
+  filter(Sample %in% combined_meta$sample) %>% 
+  group_by(Sample) %>%
+  slice_max(Expression, n = 5) %>%
+  ungroup() %>%
+  arrange(Sample, desc(Expression)) %>% 
+  group_by(GeneID) %>% 
+  summarise(sample_N = n()) %>% 
+  arrange(desc(sample_N)) %>% 
+  left_join(annotation %>% mutate(GeneID = as.character(GeneID)), by = "GeneID")
+
+# Most popular top genes
+top5_barplot <- top_5_genes %>% 
+  ggplot(aes(x = Symbol, y = sample_N))+
+  geom_bar(stat = "identity")+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 90))
+
+combined_tpm %>% 
+  pivot_longer(cols = -GeneID, names_to = "sample", values_to = "Expression") %>% 
+  filter(sample %in% combined_meta$sample) %>% 
+  filter(GeneID %in% top_5_genes$GeneID) %>% 
+  left_join(annotation %>% mutate(GeneID = as.character(GeneID)), by = "GeneID") %>% 
+  left_join(combined_meta, by = 'sample') %>% 
+  ggplot(aes(x = sample, y = Symbol, fill = Expression))+
+  geom_tile()+
+  theme(axis.text.x = element_blank())
+
+
+top5_heatmap <- combined_tpm %>% 
+  pivot_longer(cols = -GeneID, names_to = "sample", values_to = "Expression") %>% 
+  filter(sample %in% combined_meta$sample) %>% 
+  filter(GeneID %in% top_5_genes$GeneID) %>% 
+  left_join(annotation %>% mutate(GeneID = as.character(GeneID)), by = "GeneID") %>% 
+  left_join(combined_meta, by = 'sample') %>% 
+  ggplot(aes(x = sample, y = Symbol, fill = Expression)) +
+  geom_tile() +
+  facet_grid(~ dataset, scales = "free_x", space = "free_x") +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        strip.text.x = element_text(angle = 90)) +
+  labs(x = "Samples (grouped by dataset)", y = "Genes")
+
+pdf("S11.pdf", 20, 10)
+
+ggpubr::ggarrange(top5_barplot, top5_heatmap)
+
+dev.off()
+
+
+```
+
+# Var part
+```{r}
+varpart_analysis <- function(count_table, metadata, formula)
+{
+  param <- SnowParam(8, "SOCK", progressbar = TRUE)
+  
+  
+  countMatrix <- count_table %>% column_to_rownames("GeneID") %>% 
+                                  dplyr::select(any_of(metadata$sample))
+  
+  isexpr <- rowSums(cpm(countMatrix) > 0.1) >= 5
+
+  dge <- DGEList(countMatrix[isexpr, ])
+  dge <- calcNormFactors(dge)
+  
+  vobjDream <- voomWithDreamWeights(dge, formula, metadata, BPPARAM = param)
+
+  vp <- fitExtractVarPartModel(vobjDream, formula, metadata)
+  
+  return(vp)
+}
+
+
+our_vp <- varpart_analysis(our_counts, our_meta, ~ (1 | condition) + (1 | sex))
+
+GSE154881_vp <- varpart_analysis(GSE154881_counts, GSE154881_meta, ~ (1 | condition) + (1 | sex))
+
+GSE231509_vp <- varpart_analysis(GSE231509_counts, 
+                                  GSE231509_meta, 
+                                  ~ (1 | condition) + (1 | sex) + (1 | time_point) + (1 | individual))
+
+GSE153315_vp <- varpart_analysis(GSE153315_counts, GSE153315_meta, ~ (1 | condition) + (1 | sex))
+
+GSE184050_vp <- varpart_analysis(GSE184050_counts, GSE184050_meta, ~ (1 | condition) + (1 | sex) + (1 | timepoint) + (1 | individual))
+
+GSE221521_vp <- varpart_analysis(GSE221521_counts, GSE221521_meta, ~ (1 | condition) + (1 | sex))
+
+GSE185011_vp <- varpart_analysis(GSE185011_counts, GSE185011_meta, ~ (1 | condition) + (1 | sex))
+
+GSE181143_vp <- varpart_analysis(GSE181143_counts, GSE181143_meta, ~ (1 | condition) + (1 | sex) + (1 | tb_status) + (1 | timepoint) + (1 | Site) + (1 | donor_id))
+
+GSE114192_vp <- varpart_analysis(GSE114192_counts, GSE114192_meta, ~ (1 | condition) + (1 | sex) + (1 | tb_status) + (1 | field_site))
+
+
+plotVarPart(sortCols(GSE114192_vp))
+```
+# Supplement pics S1-8
+
+```{r}
+
+# GSE280402
+
+our_pca_plot <- get_vst_data(counts = our_counts,
+                  meta = our_meta,
+                  des = ~ sex + condition,
+                  main_contrast = "condition_T2D_vs_Health") %>% plotPCA(intgroup = "condition")+theme_bw()
+
+pdf("S1.pdf", 20, 10)
+
+ggpubr::ggarrange(our_dream_res %>% 
+                    transmute(baseMeanLog2 = AveExpr, log2FoldChange = logFC, padj = adj.P.Val) %>% 
+                    ggpubr::ggmaplot(fc = 0, size = .4, main = "GSE280402"),
+                  our_pca_plot,
+                  plotVarPart(sortCols(our_vp)), 
+                  labels = "AUTO")
+  
+
+dev.off()
+
+
+# GSE154881
+
+GSE154881_pca_plot <- get_vst_data(counts = GSE154881_counts,
+                  meta = GSE154881_meta,
+                  des = ~ sex + condition,
+                  main_contrast = "condition_T2D_vs_Health") %>% plotPCA(intgroup = "condition")+theme_bw()
+
+pdf("S2.pdf", 20, 10)
+
+ggpubr::ggarrange(GSE154881_dream_res %>% 
+                    transmute(baseMeanLog2 = AveExpr, log2FoldChange = logFC, padj = adj.P.Val) %>% 
+                    ggpubr::ggmaplot(fc = 0, size = .4, main = "GSE154881"),
+                  GSE154881_pca_plot,
+                  plotVarPart(sortCols(GSE154881_vp)), 
+                  labels = "AUTO")
+  
+
+dev.off()
+
+# GSE153315
+
+GSE153315_pca_plot <- get_vst_data(counts = GSE153315_counts,
+                  meta = GSE153315_meta,
+                  des = ~ sex + condition,
+                  main_contrast = "condition_T2D_vs_Health") %>% plotPCA(intgroup = "condition")+theme_bw()
+
+pdf("S3.pdf", 20, 10)
+
+ggpubr::ggarrange(GSE153315_dream_res %>% 
+                    transmute(baseMeanLog2 = AveExpr, log2FoldChange = logFC, padj = adj.P.Val) %>% 
+                    ggpubr::ggmaplot(fc = 0, size = .4, main = "GSE153315"),
+                  GSE153315_pca_plot,
+                  plotVarPart(sortCols(GSE153315_vp)), 
+                  labels = "AUTO")
+  
+
+dev.off()
+
+# GSE184050
+
+GSE184050_pca_plot <- get_vst_data(counts = GSE184050_counts,
+                  meta = GSE184050_meta,
+                  des = ~ sex + condition,
+                  main_contrast = "condition_T2D_vs_Health") %>% plotPCA(intgroup = "condition")+theme_bw()
+
+pdf("S4.pdf", 20, 10)
+
+ggpubr::ggarrange(GSE184050_dream_res %>% 
+                    transmute(baseMeanLog2 = AveExpr, log2FoldChange = logFC, padj = adj.P.Val) %>% 
+                    ggpubr::ggmaplot(fc = 0, size = .4, main = "GSE184050"),
+                  GSE184050_pca_plot,
+                  plotVarPart(sortCols(GSE184050_vp)), 
+                  labels = "AUTO")
+  
+
+dev.off()
+
+# GSE221521
+
+GSE221521_pca_plot <- get_vst_data(counts = GSE221521_counts,
+                  meta = GSE221521_meta,
+                  des = ~ sex + condition,
+                  main_contrast = "condition_T2D_vs_Health") %>% plotPCA(intgroup = "condition")+theme_bw()
+
+pdf("S5.pdf", 20, 10)
+
+ggpubr::ggarrange(GSE221521_dream_res %>% 
+                    transmute(baseMeanLog2 = AveExpr, log2FoldChange = logFC, padj = adj.P.Val) %>% 
+                    ggpubr::ggmaplot(fc = 0, size = .4, main = "GSE221521"),
+                  GSE221521_pca_plot,
+                  plotVarPart(sortCols(GSE221521_vp)), 
+                  labels = "AUTO")
+  
+
+dev.off()
+
+
+# GSE185011
+
+GSE185011_pca_plot <- get_vst_data(counts = GSE185011_counts,
+                  meta = GSE185011_meta,
+                  des = ~ sex + condition,
+                  main_contrast = "condition_T2D_vs_Health") %>% plotPCA(intgroup = "condition")+theme_bw()
+
+pdf("S6.pdf", 20, 10)
+
+ggpubr::ggarrange(GSE185011_dream_res %>% 
+                    transmute(baseMeanLog2 = AveExpr, log2FoldChange = logFC, padj = adj.P.Val) %>% 
+                    ggpubr::ggmaplot(fc = 0, size = .4, main = "GSE185011"),
+                  GSE185011_pca_plot,
+                  plotVarPart(sortCols(GSE185011_vp)), 
+                  labels = "AUTO")
+  
+
+dev.off()
+
+# GSE181143
+
+GSE181143_pca_plot <- get_vst_data(counts = GSE181143_counts,
+                  meta = GSE181143_meta,
+                  des = ~ sex + condition,
+                  main_contrast = "condition_T2D_vs_Health") %>% plotPCA(intgroup = "condition")+theme_bw()
+
+pdf("S7.pdf", 20, 10)
+
+ggpubr::ggarrange(GSE181143_dream_res %>% 
+                    transmute(baseMeanLog2 = AveExpr, log2FoldChange = logFC, padj = adj.P.Val) %>% 
+                    ggpubr::ggmaplot(fc = 0, size = .4, main = "GSE181143"),
+                  GSE181143_pca_plot,
+                  plotVarPart(sortCols(GSE181143_vp)), 
+                  labels = "AUTO")
+  
+
+dev.off()
+
+# GSE114192
+
+GSE114192_pca_plot <- get_vst_data(counts = GSE114192_counts,
+                  meta = GSE114192_meta,
+                  des = ~ sex + condition,
+                  main_contrast = "condition_T2D_vs_Health") %>% plotPCA(intgroup = "condition")+theme_bw()
+
+pdf("S8.pdf", 20, 10)
+
+ggpubr::ggarrange(GSE114192_dream_res %>% 
+                    transmute(baseMeanLog2 = AveExpr, log2FoldChange = logFC, padj = adj.P.Val) %>% 
+                    ggpubr::ggmaplot(fc = 0, size = .4, main = "GSE114192"),
+                  GSE114192_pca_plot,
+                  plotVarPart(sortCols(GSE114192_vp)), 
+                  labels = "AUTO")
+  
+
+dev.off()
+
+
+```
